@@ -1,0 +1,129 @@
+name: Windows Abrupt-Exit Recovery Fixtures
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  synthetic-crash-recovery:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 6
+    steps:
+      - name: Validate fictional durable stages after process exit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -cne 'Windows') { throw 'NOT_WINDOWS' }
+          $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          if (-not [IO.Directory]::Exists($runnerTemp)) { throw 'TEMP_MISSING' }
+          $lab = [IO.Path]::GetFullPath((Join-Path $runnerTemp ('synthetic-abrupt-' + [guid]::NewGuid().ToString('N'))))
+          if (-not $lab.StartsWith($runnerTemp + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'PATH_ESCAPE' }
+          if ([IO.Directory]::Exists($lab)) { throw 'ALREADY_EXISTS' }
+          [void][IO.Directory]::CreateDirectory($lab)
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          $checks = 0
+          function Assert-Check([bool]$condition, [string]$name) {
+            if (-not $condition) { throw ('CHECK_FAILED_' + $name) }
+            $script:checks++
+            Write-Output ('PASS=' + $name)
+          }
+          function Hash([byte[]]$data) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($data)) }
+          $childTemplate = @'
+          $ErrorActionPreference = 'Stop'
+          $dir = '__DIRECTORY__'
+          $phase = '__PHASE__'
+          $op = 'fictitious-' + $phase
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          [void][IO.Directory]::CreateDirectory($dir)
+          function Store([string]$name, [byte[]]$content) {
+            $target = [IO.Path]::Combine($dir, $name)
+            $stream = [IO.File]::Open($target,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+            try { $stream.Write($content,0,$content.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+            return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($content))
+          }
+          if ($phase -eq 'before') { [Environment]::Exit(37) }
+          $intent = [ordered]@{ operationId = $op; previous = 'SYNTHETIC_GENESIS'; phase = 'prepared'; unknown = 'keep' }
+          $intentHash = Store 'intent.json' ($utf8.GetBytes((ConvertTo-Json -InputObject $intent -Compress)))
+          if ($phase -eq 'intent') {
+            $lock = [IO.File]::Open([IO.Path]::Combine($dir,'handle.dat'),[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+            [Environment]::Exit(37)
+          }
+          $effect = [ordered]@{ operationId = $op; intentHash = $intentHash; resource = 'FICTIONAL_BRANCH_ONLY' }
+          $effectHash = Store 'effect.json' ($utf8.GetBytes((ConvertTo-Json -InputObject $effect -Compress)))
+          if ($phase -eq 'effect') {
+            $lock = [IO.File]::Open([IO.Path]::Combine($dir,'handle.dat'),[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+            [Environment]::Exit(37)
+          }
+          $commit = [ordered]@{ operationId = $op; effectHash = $effectHash; phase = 'confirmed' }
+          $null = Store 'confirmed.json' ($utf8.GetBytes((ConvertTo-Json -InputObject $commit -Compress)))
+          $lock = [IO.File]::Open([IO.Path]::Combine($dir,'handle.dat'),[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+          [Environment]::Exit(37)
+          '@
+          $stages = @('before','intent','effect','committed')
+          foreach ($stage in $stages) {
+            $dir = [IO.Path]::Combine($lab,$stage)
+            if ([IO.Directory]::Exists($dir)) { throw ('STAGE_COLLISION_' + $stage) }
+            $child = $childTemplate.Replace('__DIRECTORY__',$dir.Replace("'","''")).Replace('__PHASE__',$stage)
+            $exe = (Get-Command pwsh.exe -ErrorAction Stop).Source
+            $info = [Diagnostics.ProcessStartInfo]::new($exe)
+            $info.UseShellExecute = $false
+            $info.CreateNoWindow = $true
+            $info.WorkingDirectory = $runnerTemp
+            foreach ($arg in @('-NoProfile','-NonInteractive','-EncodedCommand',[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child)))) {
+              [void]$info.ArgumentList.Add($arg)
+            }
+            $process = [Diagnostics.Process]::Start($info)
+            if ($null -eq $process) { throw ('NO_CHILD_' + $stage) }
+            try {
+              if (-not $process.WaitForExit(15000)) { throw ('CHILD_NOT_FINISHED_' + $stage) }
+              Assert-Check ($process.ExitCode -eq 37) ('EXPECTED_ABRUPT_EXIT_' + $stage.ToUpperInvariant())
+            } finally { $process.Dispose() }
+            $intentPath = [IO.Path]::Combine($dir,'intent.json')
+            $effectPath = [IO.Path]::Combine($dir,'effect.json')
+            $commitPath = [IO.Path]::Combine($dir,'confirmed.json')
+            $hasIntent = [IO.File]::Exists($intentPath)
+            $hasEffect = [IO.File]::Exists($effectPath)
+            $hasCommit = [IO.File]::Exists($commitPath)
+            $expected = switch ($stage) {
+              'before'    { @($false,$false,$false) }
+              'intent'    { @($true,$false,$false) }
+              'effect'    { @($true,$true,$false) }
+              'committed' { @($true,$true,$true) }
+            }
+            Assert-Check ($hasIntent -eq $expected[0] -and $hasEffect -eq $expected[1] -and $hasCommit -eq $expected[2]) ('PHASE_FILES_' + $stage.ToUpperInvariant())
+            if ($hasIntent) {
+              $intentBytes = [IO.File]::ReadAllBytes($intentPath)
+              $intent = [Text.Encoding]::UTF8.GetString($intentBytes) | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+              Assert-Check ($intent.unknown -ceq 'keep' -and $intent.operationId -ceq ('fictitious-' + $stage)) ('INTENT_INTEGRITY_' + $stage.ToUpperInvariant())
+              if ($hasEffect) {
+                $effectBytes = [IO.File]::ReadAllBytes($effectPath)
+                $effect = [Text.Encoding]::UTF8.GetString($effectBytes) | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+                Assert-Check ($effect.intentHash -ceq (Hash $intentBytes) -and $effect.operationId -ceq $intent.operationId) ('EFFECT_PROVENANCE_' + $stage.ToUpperInvariant())
+                if ($hasCommit) {
+                  $commit = [IO.File]::ReadAllText($commitPath,$utf8) | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+                  Assert-Check ($commit.effectHash -ceq (Hash $effectBytes) -and $commit.operationId -ceq $intent.operationId) 'COMMIT_PROVENANCE'
+                }
+              }
+              $duplicateRejected = $false
+              try {
+                $dupe = [IO.File]::Open($intentPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+                $dupe.Dispose()
+              } catch [IO.IOException] { $duplicateRejected = $true }
+              Assert-Check $duplicateRejected ('RETRY_CANNOT_OVERWRITE_' + $stage.ToUpperInvariant())
+              Assert-Check ((Hash ([IO.File]::ReadAllBytes($intentPath))) -ceq (Hash $intentBytes)) ('INTENT_STILL_UNCHANGED_' + $stage.ToUpperInvariant())
+            }
+            $classification = if (-not $hasIntent) { 'NO_INTENT' } elseif (-not $hasEffect) { 'PENDING_NO_EFFECT' } elseif (-not $hasCommit) { 'PENDING_EFFECT_NOT_CONFIRMED' } else { 'CONFIRMED' }
+            Assert-Check ($classification -ceq (@{ before='NO_INTENT'; intent='PENDING_NO_EFFECT'; effect='PENDING_EFFECT_NOT_CONFIRMED'; committed='CONFIRMED' }[$stage])) ('FAIL_CLOSED_CLASSIFICATION_' + $stage.ToUpperInvariant())
+            $handle = [IO.Path]::Combine($dir,'handle.dat')
+            if ([IO.File]::Exists($handle)) {
+              $reopen = [IO.File]::Open($handle,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+              try { Assert-Check ($reopen.Length -eq 0) ('HANDLE_RELEASED_ON_EXIT_' + $stage.ToUpperInvariant()) } finally { $reopen.Dispose() }
+              Assert-Check ([IO.File]::Exists($handle)) ('HISTORICAL_HANDLE_FILE_PRESERVED_' + $stage.ToUpperInvariant())
+            }
+          }
+          $all = @(Get-ChildItem -LiteralPath $lab -File -Recurse -Force)
+          Assert-Check ($all.Count -eq 9) 'ONLY_EXPECTED_NINE_FICTIONAL_FILES'
+          Write-Output ('LAB_PASS=1 TESTS=' + $checks + ' FILES=' + $all.Count + ' LOGICAL_BYTES=' + (($all | Measure-Object Length -Sum).Sum))
+          Write-Output 'ALL_TEST_DATA_SYNTHETIC_IN_RUNNER_TEMP_NO_CHECKOUT_NO_CLEANUP_NO_ARTIFACT_UPLOAD=TRUE'
