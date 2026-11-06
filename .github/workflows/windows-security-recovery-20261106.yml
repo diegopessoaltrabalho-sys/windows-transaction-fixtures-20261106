@@ -1,0 +1,161 @@
+name: Synthetic Windows Identity and Recovery Lab
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  isolated-identities-and-crash:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - name: Verify independent user and interrupted fictional ledger
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          if ($env:RUNNER_OS -cne 'Windows') { throw 'WINDOWS_REQUIRED' }
+          $root = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root -PathType Container)) { throw 'UNTRUSTED_RUNNER_TEMP' }
+          if ((Get-Item -LiteralPath $root -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'RUNNER_TEMP_REPARSE' }
+          $lab = [IO.Path]::GetFullPath((Join-Path $root ('fictional-security-' + [guid]::NewGuid().ToString('N'))))
+          if (-not $lab.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'LAB_PATH_OUTSIDE_RUNNER_TEMP' }
+          if (Test-Path -LiteralPath $lab) { throw 'LAB_EXISTS' }
+          [void][IO.Directory]::CreateDirectory($lab)
+          $checks = 0
+          function Assert-Check([bool]$condition, [string]$label) {
+            if (-not $condition) { throw ('CHECK_FAILED_' + $label) }
+            $script:checks++
+            Write-Output ('PASS=' + $label)
+          }
+          function New-ExclusiveBytes([string]$path, [byte[]]$bytes) {
+            if (-not ([IO.Path]::GetFullPath($path)).StartsWith($script:lab + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'FILE_OUTSIDE_LAB' }
+            $handle = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $handle.Write($bytes, 0, $bytes.Length); $handle.Flush($true) } finally { $handle.Dispose() }
+          }
+          function Digest([byte[]]$bytes) { return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)) }
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          Assert-Check (Test-Path -LiteralPath $lab -PathType Container) 'ONLY_NEW_TEMP_LAB'
+          $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          Assert-Check ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'RUNNER_ADMIN_TOKEN_VERIFIED'
+          # An account created inside this ephemeral runner, never on the user's device.
+          $userName = 'fict' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+          if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) { throw 'FICTIONAL_USER_COLLISION' }
+          $passwordText = ('Aa9!' + [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
+          $password = ConvertTo-SecureString $passwordText -AsPlainText -Force
+          $passwordText = $null
+          $user = New-LocalUser -Name $userName -Password $password -AccountNeverExpires -Description 'Fictional runner-only security test'
+          Assert-Check ($user.Name -ceq $userName) 'FICTIONAL_STANDARD_USER_CREATED'
+          $userFull = $env:COMPUTERNAME + '\' + $userName
+          $acl = Get-Acl -LiteralPath $lab
+          # All ACL changes apply solely to this newly created synthetic directory.
+          $acl.SetAccessRuleProtection($true, $false)
+          $inherit = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+          $propagate = [Security.AccessControl.PropagationFlags]::None
+          $allow = [Security.AccessControl.AccessControlType]::Allow
+          $admins = [Security.AccessControl.FileSystemAccessRule]::new('BUILTIN\Administrators', [Security.AccessControl.FileSystemRights]::FullControl, $inherit, $propagate, $allow)
+          $system = [Security.AccessControl.FileSystemAccessRule]::new('NT AUTHORITY\SYSTEM', [Security.AccessControl.FileSystemRights]::FullControl, $inherit, $propagate, $allow)
+          $reader = [Security.AccessControl.FileSystemAccessRule]::new($userFull, [Security.AccessControl.FileSystemRights]::ReadAndExecute, $inherit, $propagate, $allow)
+          [void]$acl.AddAccessRule($admins)
+          [void]$acl.AddAccessRule($system)
+          [void]$acl.AddAccessRule($reader)
+          Set-Acl -LiteralPath $lab -AclObject $acl
+          $protected = Join-Path $lab 'fictional-ledger.json'
+          $expectedText = '{"fictional":true,"record":1}'
+          New-ExclusiveBytes $protected ($utf8.GetBytes($expectedText))
+          $expectedDigest = Digest ([IO.File]::ReadAllBytes($protected))
+          Assert-Check ($expectedDigest -ceq (Digest ($utf8.GetBytes($expectedText)))) 'PROTECTED_FIXTURE_READBACK'
+          $restrictedScript = @'
+          $ErrorActionPreference = 'Stop'
+          $expectedIdentity = '__USER_ID__'
+          $actual = [Security.Principal.WindowsIdentity]::GetCurrent()
+          if ($actual.Name -ine $expectedIdentity) { exit 41 }
+          $role = [Security.Principal.WindowsPrincipal]::new($actual)
+          if ($role.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 42 }
+          $parent = '__LAB_PATH__'
+          $ledger = [IO.Path]::Combine($parent, 'fictional-ledger.json')
+          try { $read = [IO.File]::ReadAllText($ledger) } catch { exit 43 }
+          if ($read -cne '{"fictional":true,"record":1}') { exit 44 }
+          $writeHandleGranted = $false
+          try {
+            $writer = [IO.File]::Open($ledger, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            $writeHandleGranted = $true
+            $writer.Dispose()
+          } catch [UnauthorizedAccessException] { } catch [IO.IOException] { }
+          if ($writeHandleGranted) { exit 50 }
+          $newFileGranted = $false
+          try {
+            $new = [IO.File]::Open([IO.Path]::Combine($parent, 'unexpected-fictional-new.json'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $newFileGranted = $true
+            $new.Dispose()
+          } catch [UnauthorizedAccessException] { } catch [IO.IOException] { }
+          if ($newFileGranted) { exit 51 }
+          exit 17
+          '@
+          $restrictedScript = $restrictedScript.Replace('__USER_ID__', $userFull.Replace("'", "''")).Replace('__LAB_PATH__', $lab.Replace("'", "''"))
+          $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+          $childInfo = [Diagnostics.ProcessStartInfo]::new($pwsh)
+          $childInfo.UseShellExecute = $false
+          $childInfo.CreateNoWindow = $true
+          $childInfo.LoadUserProfile = $true
+          $childInfo.UserName = $userName
+          $childInfo.Domain = $env:COMPUTERNAME
+          $childInfo.Password = $password
+          foreach ($arg in @('-NoProfile', '-NonInteractive', '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($restrictedScript)))) { [void]$childInfo.ArgumentList.Add($arg) }
+          $child = [Diagnostics.Process]::Start($childInfo)
+          if ($null -eq $child) { throw 'RESTRICTED_PROCESS_START_FAILED' }
+          try {
+            if (-not $child.WaitForExit(15000)) { throw 'RESTRICTED_PROCESS_TIMEOUT' }
+            Assert-Check ($child.ExitCode -eq 17) ('RESTRICTED_IDENTITY_READ_ONLY_EXIT_' + $child.ExitCode)
+          } finally { $child.Dispose() }
+          Assert-Check ((Digest ([IO.File]::ReadAllBytes($protected))) -ceq $expectedDigest) 'FILE_HASH_UNCHANGED_AFTER_RESTRICTED_PROCESS'
+          Assert-Check (-not (Test-Path -LiteralPath (Join-Path $lab 'unexpected-fictional-new.json'))) 'RESTRICTED_USER_CREATED_NO_FILE'
+          # Separate crash fixture. Child creates only new fake files then aborts itself.
+          $crashDir = Join-Path $lab 'fictional-crash'
+          if (Test-Path -LiteralPath $crashDir) { throw 'CRASH_DIR_ALREADY_EXISTS' }
+          [void][IO.Directory]::CreateDirectory($crashDir)
+          $crashScript = @'
+          $ErrorActionPreference = 'Stop'
+          $dir = '__CRASH_DIR__'
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          function New-Written([string]$name, [byte[]]$bytes) {
+            $file = [IO.Path]::Combine($dir, $name)
+            $stream = [IO.File]::Open($file, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+          }
+          $lockFile = [IO.Path]::Combine($dir, 'fictional-operation.lock')
+          $lock = [IO.File]::Open($lockFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+          New-Written 'intent.json' ($utf8.GetBytes('{"operationId":"fictional-crash","status":"prepared"}'))
+          New-Written 'partial-commit.json' ($utf8.GetBytes('{"operationId":"fictional-crash",'))
+          $lock.Flush($true)
+          [Environment]::FailFast('Intentional termination of isolated fictional child after two flushed files')
+          '@
+          $crashScript = $crashScript.Replace('__CRASH_DIR__', $crashDir.Replace("'", "''"))
+          $crashInfo = [Diagnostics.ProcessStartInfo]::new($pwsh)
+          $crashInfo.UseShellExecute = $false
+          $crashInfo.CreateNoWindow = $true
+          foreach ($arg in @('-NoProfile', '-NonInteractive', '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($crashScript)))) { [void]$crashInfo.ArgumentList.Add($arg) }
+          $crashChild = [Diagnostics.Process]::Start($crashInfo)
+          if ($null -eq $crashChild) { throw 'CRASH_CHILD_START_FAILED' }
+          try {
+            if (-not $crashChild.WaitForExit(15000)) { throw 'CRASH_CHILD_TIMEOUT' }
+            Assert-Check ($crashChild.ExitCode -ne 0) 'SYNTHETIC_CHILD_EXITED_ABNORMALLY'
+          } finally { $crashChild.Dispose() }
+          $intentPath = Join-Path $crashDir 'intent.json'
+          $partialPath = Join-Path $crashDir 'partial-commit.json'
+          $lockPath = Join-Path $crashDir 'fictional-operation.lock'
+          Assert-Check ((Test-Path -LiteralPath $intentPath -PathType Leaf) -and (Test-Path -LiteralPath $partialPath -PathType Leaf)) 'CRASH_LEFT_BOTH_FICTIONAL_FILES'
+          $intent = [IO.File]::ReadAllText($intentPath, $utf8) | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+          Assert-Check ($intent.operationId -ceq 'fictional-crash' -and $intent.status -ceq 'prepared') 'DURABLE_INTENT_RECOGNIZED_AFTER_CHILD_CRASH'
+          $corruptRejected = $false
+          try { $null = [IO.File]::ReadAllText($partialPath, $utf8) | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { $corruptRejected = $true }
+          Assert-Check $corruptRejected 'PARTIAL_COMMIT_REJECTED_WITHOUT_REWRITE'
+          $reopened = [IO.File]::Open($lockPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+          try { Assert-Check ($reopened.Length -ge 0) 'CRASH_RELEASED_KERNEL_LOCK' } finally { $reopened.Dispose() }
+          Assert-Check (-not (Test-Path -LiteralPath (Join-Path $crashDir 'confirmed.json'))) 'NO_FALSE_COMMIT_AFTER_CRASH'
+          $files = @(Get-ChildItem -LiteralPath $lab -Recurse -File -Force)
+          Assert-Check ($files.Count -eq 4) 'ONLY_FOUR_SYNTHETIC_FILES_PERSIST'
+          Write-Output ('LAB_PASS=1 TESTS=' + $checks + ' FILES=' + $files.Count + ' LOGICAL_BYTES=' + (($files | Measure-Object Length -Sum).Sum))
+          Write-Output 'RUNNER_ONLY_SYNTHETIC_NO_PRIVATE_CHECKOUT_NO_CLEANUP_NO_ARTIFACT_UPLOAD=TRUE'
