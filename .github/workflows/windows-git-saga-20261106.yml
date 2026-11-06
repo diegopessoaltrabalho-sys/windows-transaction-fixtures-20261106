@@ -1,0 +1,135 @@
+name: Windows Synthetic Git Saga
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  fictional-git-worktree-recovery:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 6
+    steps:
+      - name: Verify fictitious Git worktree side effects and journal evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -cne 'Windows') { throw 'WINDOWS_RUNNER_REQUIRED' }
+          $tempRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          if (-not [IO.Directory]::Exists($tempRoot)) { throw 'RUNNER_TEMP_ABSENT' }
+          $lab = [IO.Path]::GetFullPath((Join-Path $tempRoot ('fictional-git-saga-' + [guid]::NewGuid().ToString('N'))))
+          if (-not $lab.StartsWith($tempRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'ESCAPED_RUNNER_TEMP' }
+          if ([IO.Directory]::Exists($lab)) { throw 'EXISTING_LAB_PATH' }
+          [void][IO.Directory]::CreateDirectory($lab)
+          $repository = [IO.Path]::Combine($lab,'fictitious-repository')
+          $journal = [IO.Path]::Combine($lab,'fictitious-journal')
+          [void][IO.Directory]::CreateDirectory($journal)
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          $checks = 0
+          function Check([bool]$ok,[string]$name) {
+            if (-not $ok) { throw ('FAILED_' + $name) }
+            $script:checks++
+            Write-Output ('PASS=' + $name)
+          }
+          function Git-Read([string]$directory,[string[]]$arguments) {
+            $result = @(& git -C $directory @arguments)
+            if ($LASTEXITCODE -ne 0) { throw ('GIT_READ_FAILED_' + ($arguments -join '_')) }
+            return $result
+          }
+          function New-Fixture([string]$name,[byte[]]$value) {
+            if ($name -cnotmatch '^[a-z0-9-]+\.json$') { throw 'FILENAME_OUT_OF_SCOPE' }
+            $path = [IO.Path]::Combine($journal,$name)
+            $stream = [IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+            try { $stream.Write($value,0,$value.Length);$stream.Flush($true) } finally { $stream.Dispose() }
+            return $path
+          }
+          function Digest([byte[]]$value) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($value)) }
+          $null = & git init -b main $repository
+          if ($LASTEXITCODE -ne 0) { throw 'SYNTHETIC_GIT_INIT_FAILED' }
+          $null = & git -C $repository config user.email fictional@example.invalid
+          if ($LASTEXITCODE -ne 0) { throw 'SYNTHETIC_IDENTITY_FAILED' }
+          $null = & git -C $repository config user.name 'Fictional Lab Only'
+          if ($LASTEXITCODE -ne 0) { throw 'SYNTHETIC_NAME_FAILED' }
+          [IO.File]::WriteAllText([IO.Path]::Combine($repository,'fictional.txt'),'ONLY_SUITABLE_FOR_SYNTHETIC_TESTS',$utf8)
+          $null = & git -C $repository add -- fictional.txt
+          if ($LASTEXITCODE -ne 0) { throw 'SYNTHETIC_STAGE_FAILED' }
+          $null = & git -C $repository commit -m 'Synthetic baseline commit'
+          if ($LASTEXITCODE -ne 0) { throw 'SYNTHETIC_BASE_COMMIT_FAILED' }
+          $baseline = (Git-Read $repository @('rev-parse','HEAD') | Select-Object -Last 1).Trim()
+          Check ($baseline -match '^[0-9a-f]{40}$') 'SYNTHETIC_BASELINE_COMMIT'
+          $registry = [ordered]@{ schemaVersion=1; preserveUnknown='legacy'; fronts=@(for($i=0;$i -lt 168;$i++){[ordered]@{frontId=('fake-'+$i);status='active';opaque='keep'}}) }
+          $registryPath = New-Fixture 'original-registry.json' ($utf8.GetBytes((ConvertTo-Json -InputObject $registry -Compress -Depth 8)))
+          $registryHash = Digest ([IO.File]::ReadAllBytes($registryPath))
+          $opId = 'synthetic-op-20261106'
+          $branch = 'qa-front/synthetic-branch-20261106'
+          $worktree = [IO.Path]::Combine($lab,'synthetic-worktree')
+          $intent = [ordered]@{ operationId=$opId; baseline=$baseline; branch=$branch; worktree=$worktree; gitCommon='synthetic'; previous=$registryHash }
+          $intentPath = New-Fixture 'intent.json' ($utf8.GetBytes((ConvertTo-Json -InputObject $intent -Compress)))
+          $intentHash = Digest ([IO.File]::ReadAllBytes($intentPath))
+          Check ([IO.File]::Exists($intentPath) -and -not [IO.Directory]::Exists($worktree)) 'INTENT_PERSISTED_BEFORE_GIT'
+          $child = @'
+          $ErrorActionPreference = 'Stop'
+          $repository = '__REPO__'
+          $branch = '__BRANCH__'
+          $worktree = '__WORKTREE__'
+          $baseline = '__BASELINE__'
+          $null = & git -C $repository worktree add -b $branch $worktree $baseline 2>&1
+          if ($LASTEXITCODE -ne 0) { [Environment]::Exit(89) }
+          [Environment]::Exit(37)
+          '@
+          $child=$child.Replace('__REPO__',$repository.Replace("'","''")).Replace('__BRANCH__',$branch).Replace('__WORKTREE__',$worktree.Replace("'","''")).Replace('__BASELINE__',$baseline)
+          $info = [Diagnostics.ProcessStartInfo]::new((Get-Command pwsh.exe -ErrorAction Stop).Source)
+          $info.UseShellExecute=$false
+          $info.CreateNoWindow=$true
+          $info.WorkingDirectory=$tempRoot
+          foreach($arg in @('-NoProfile','-NonInteractive','-EncodedCommand',[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child)))){[void]$info.ArgumentList.Add($arg)}
+          $p=[Diagnostics.Process]::Start($info)
+          if ($null -eq $p) { throw 'CHILD_START_FAILED' }
+          try {
+            if (-not $p.WaitForExit(15000)) { throw 'CHILD_TIMEOUT' }
+            Check ($p.ExitCode -eq 37) 'GIT_CHILD_EXITED_AFTER_WORKTREE_ADD'
+          } finally { $p.Dispose() }
+          Check ([IO.Directory]::Exists($worktree)) 'GIT_EFFECT_PRESENT_AFTER_INTERRUPTION'
+          $branchActual = (Git-Read $worktree @('branch','--show-current')|Select-Object -Last 1).Trim()
+          $headActual = (Git-Read $worktree @('rev-parse','HEAD')|Select-Object -Last 1).Trim()
+          Check ($branchActual -ceq $branch -and $headActual -ceq $baseline) 'GIT_EFFECT_IDENTITY_VERIFIED'
+          $commonBase=(Git-Read $repository @('rev-parse','--path-format=absolute','--git-common-dir')|Select-Object -Last 1).Trim()
+          $commonWork=(Git-Read $worktree @('rev-parse','--path-format=absolute','--git-common-dir')|Select-Object -Last 1).Trim()
+          Check ([string]::Equals($commonBase,$commonWork,[StringComparison]::OrdinalIgnoreCase)) 'GIT_COMMON_DIRECTORY_MATCH'
+          Check ((Digest ([IO.File]::ReadAllBytes($registryPath))) -ceq $registryHash) 'ORIGINAL_REGISTRY_STILL_UNCHANGED'
+          Check (-not [IO.File]::Exists([IO.Path]::Combine($journal,'confirmation.json'))) 'NO_FALSE_REGISTRY_CONFIRMATION'
+          $worktreeStatus=@(& git -C $worktree status --porcelain=v1)
+          if($LASTEXITCODE -ne 0){throw 'GIT_WORKTREE_STATUS_FAILED'}
+          Check ($worktreeStatus.Count -eq 0) 'SYNTHETIC_WORKTREE_CLEAN'
+          $intentData=[IO.File]::ReadAllText($intentPath,$utf8)|ConvertFrom-Json -AsHashtable -ErrorAction Stop
+          Check ($intentData.operationId -ceq $opId -and $intentData.previous -ceq $registryHash -and $intentData.baseline -ceq $baseline) 'INTENT_CHAIN_RECORDED'
+          $retryRejected=$false
+          try {$fh=[IO.File]::Open($intentPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None);$fh.Dispose()} catch [IO.IOException] {$retryRejected=$true}
+          Check $retryRejected 'RETRY_CANNOT_OVERWRITE_INTENT'
+          Check ((Digest ([IO.File]::ReadAllBytes($intentPath))) -ceq $intentHash) 'INTENT_BYTES_PRESERVED'
+          # A conflicting branch name must never claim a second worktree.
+          $collisionPath=[IO.Path]::Combine($lab,'would-collide')
+          $null = & git -C $repository worktree add -b $branch $collisionPath $baseline 2>&1
+          $collisionExit=$LASTEXITCODE
+          Check ($collisionExit -ne 0) 'GIT_BRANCH_COLLISION_DETECTED'
+          Check (-not [IO.Directory]::Exists($collisionPath)) 'NO_COLLISION_WORKTREE_CREATED'
+          # Another Git worktree with no intent is structurally sound, but has no provenance.
+          $foreignPath=[IO.Path]::Combine($lab,'unproven-worktree')
+          $foreignBranch='qa-front/unproven-fake-20261106'
+          $null = & git -C $repository worktree add -b $foreignBranch $foreignPath $baseline 2>&1
+          if($LASTEXITCODE -ne 0){throw 'UNPROVEN_FIXTURE_CREATION_FAILED'}
+          Check ([IO.Directory]::Exists($foreignPath)) 'UNPROVEN_GIT_WORKTREE_EXISTS'
+          Check (-not [IO.File]::Exists([IO.Path]::Combine($journal,'unproven-intent.json'))) 'UNPROVEN_GIT_MUST_NOT_AUTO_ADOPT'
+          # Confirm the proven interrupted operation using append-only evidence without changing its original registry.
+          $proof=[ordered]@{ operationId=$opId; intentHash=$intentHash; baseline=$baseline; branch=$branch; worktree=$worktree; verified=$true }
+          $proofPath=New-Fixture 'confirmation.json' ($utf8.GetBytes((ConvertTo-Json -InputObject $proof -Compress)))
+          $readProof=[IO.File]::ReadAllText($proofPath,$utf8)|ConvertFrom-Json -AsHashtable -ErrorAction Stop
+          Check ($readProof.operationId -ceq $opId -and $readProof.intentHash -ceq $intentHash -and $readProof.verified -eq $true) 'APPEND_ONLY_PROOF_CONFIRMED'
+          Check ((Digest ([IO.File]::ReadAllBytes($registryPath))) -ceq $registryHash) 'ORIGINAL_REGISTRY_PRESERVED_AFTER_CONFIRMATION'
+          $allWorktrees=@(& git -C $repository worktree list --porcelain)
+          if ($LASTEXITCODE -ne 0) { throw 'GIT_WORKTREE_LIST_FAILED' }
+          $worktreeMarkers=@($allWorktrees|Where-Object{$_ -match '^worktree '})
+          Check ($worktreeMarkers.Count -eq 3) 'THREE_FICTIONAL_WORKTREES_PRESERVED'
+          Write-Output ('LAB_PASS=1 TESTS='+$checks+' SYNTHETIC_GIT_WORKTREES='+$worktreeMarkers.Count+' JOURNAL_FILES='+@(Get-ChildItem -LiteralPath $journal -File).Count)
+          Write-Output 'NO_PRIVATE_REPO_NO_CLEANUP_NO_ARTIFACT_UPLOAD_NO_NETWORK_PUSH=TRUE'
