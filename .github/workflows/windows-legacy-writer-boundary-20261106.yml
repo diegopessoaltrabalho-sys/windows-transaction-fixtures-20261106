@@ -1,0 +1,125 @@
+name: Windows Synthetic Legacy Writer Boundary
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  legacy-writer-boundary:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 6
+    steps:
+      - name: Prove limitations of a voluntary lock using fictional files and Git
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -cne 'Windows') { throw 'NOT_WINDOWS' }
+          $parent = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          $lab = [IO.Path]::GetFullPath((Join-Path $parent ('fictional-writer-boundary-' + [guid]::NewGuid().ToString('N'))))
+          if (-not $lab.StartsWith($parent + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'OUTSIDE_RUNNER_TEMP' }
+          if (Test-Path -LiteralPath $lab) { throw 'LAB_ALREADY_EXISTS' }
+          [void][IO.Directory]::CreateDirectory($lab)
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          $passed = 0
+          function Assert-Case([bool]$predicate, [string]$case) {
+            if (-not $predicate) { throw ('FAILED_' + $case) }
+            $script:passed++
+            Write-Output ('PASS=' + $case)
+          }
+          function Quote-PS([string]$value) { return "'" + $value.Replace("'", "''") + "'" }
+          function Invoke-OneChild([string]$script) {
+            $app = (Get-Command pwsh.exe -ErrorAction Stop).Source
+            $info = [Diagnostics.ProcessStartInfo]::new($app)
+            $info.UseShellExecute = $false
+            $info.CreateNoWindow = $true
+            $info.WorkingDirectory = $lab
+            [void]$info.ArgumentList.Add('-NoProfile')
+            [void]$info.ArgumentList.Add('-NonInteractive')
+            [void]$info.ArgumentList.Add('-EncodedCommand')
+            [void]$info.ArgumentList.Add([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script)))
+            $child = [Diagnostics.Process]::Start($info)
+            if ($null -eq $child) { throw 'CHILD_LAUNCH_FAILED' }
+            try {
+              if (-not $child.WaitForExit(15000)) { throw 'CHILD_TIMEOUT_NO_RETRY' }
+              return $child.ExitCode
+            } finally { $child.Dispose() }
+          }
+          function Create-FictionalText([string]$path, [string]$value) {
+            $bytes = $utf8.GetBytes($value)
+            $h = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $h.Write($bytes, 0, $bytes.Length); $h.Flush($true) } finally { $h.Dispose() }
+          }
+          Assert-Case (Test-Path -LiteralPath $lab -PathType Container) 'ISOLATED_NEW_LAB_EXISTS'
+          $guardPath = Join-Path $lab 'fronts.lock'
+          $guard = [IO.File]::Open($guardPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+          try {
+            $siblingPath = Join-Path $lab 'legacy-uncooperative.json'
+            $childCreate = @'
+          $p = __PATH__
+          $v = [Text.UTF8Encoding]::new($false).GetBytes('fictional-legacy-writer')
+          try {
+            $h = [IO.File]::Open($p, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $h.Write($v,0,$v.Length); $h.Flush($true) } finally { $h.Dispose() }
+            exit 0
+          } catch { exit 73 }
+          '@.Replace('__PATH__', (Quote-PS $siblingPath))
+            $firstExit = Invoke-OneChild $childCreate
+            Assert-Case ($firstExit -eq 0 -and (Test-Path -LiteralPath $siblingPath -PathType Leaf)) 'UNCOOPERATIVE_CHILD_WRITES_SIBLING_DESPITE_GUARD_LOCK'
+            Assert-Case ([IO.File]::ReadAllText($siblingPath, $utf8) -ceq 'fictional-legacy-writer') 'UNCOOPERATIVE_WRITE_OBSERVED_EXACTLY'
+            $repo = Join-Path $lab 'fresh-fictional-git'
+            if (Test-Path -LiteralPath $repo) { throw 'GIT_LAB_EXISTS' }
+            [void][IO.Directory]::CreateDirectory($repo)
+            & git init --initial-branch=main $repo | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'GIT_INIT_FAILED' }
+            & git -C $repo config user.email 'fictional@example.invalid'
+            if ($LASTEXITCODE -ne 0) { throw 'GIT_EMAIL_FAILED' }
+            & git -C $repo config user.name 'Fictional Test'
+            if ($LASTEXITCODE -ne 0) { throw 'GIT_USER_FAILED' }
+            Create-FictionalText (Join-Path $repo 'fixture.txt') 'fictional-initial-commit'
+            & git -C $repo add -- fixture.txt
+            if ($LASTEXITCODE -ne 0) { throw 'GIT_ADD_FAILED' }
+            & git -C $repo commit -m 'Fictional setup' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'GIT_COMMIT_FAILED' }
+            $childGit = @'
+          & git -C __REPO__ branch legacy-uncooperative
+          if ($LASTEXITCODE -ne 0) { exit 83 }
+          exit 0
+          '@.Replace('__REPO__', (Quote-PS $repo))
+            $gitExit = Invoke-OneChild $childGit
+            & git --no-optional-locks -C $repo show-ref --verify --quiet refs/heads/legacy-uncooperative
+            $branchExists = ($LASTEXITCODE -eq 0)
+            Assert-Case ($gitExit -eq 0 -and $branchExists) 'UNCOOPERATIVE_CHILD_WRITES_GIT_REF_DESPITE_GUARD_LOCK'
+            Assert-Case ($guard.CanRead -and $guard.CanWrite) 'GUARD_REMAINS_HELD_WHILE_GIT_WAS_MUTATED'
+          } finally { $guard.Dispose() }
+          $fixture = Join-Path $lab 'protected-current.json'
+          Create-FictionalText $fixture 'known-original-bytes'
+          $target = [IO.File]::Open($fixture, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+          try {
+            $childDirect = @'
+          try {
+            $h = [IO.File]::Open(__TARGET__, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            $h.Dispose()
+            exit 0
+          } catch [IO.IOException] { exit 17 } catch { exit 82 }
+          '@.Replace('__TARGET__', (Quote-PS $fixture))
+            $blockedExit = Invoke-OneChild $childDirect
+            Assert-Case ($blockedExit -eq 17) 'FILESHARE_PROTECTS_EXACT_OPEN_FILE'
+            $differentPath = Join-Path $lab 'still-writable-sibling.json'
+            $childElsewhere = @'
+          $p = __PATH__
+          try {
+            $h = [IO.File]::Open($p, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $v = [byte[]](65,66,67); $h.Write($v,0,$v.Length); $h.Flush($true) } finally { $h.Dispose() }
+            exit 0
+          } catch { exit 81 }
+          '@.Replace('__PATH__', (Quote-PS $differentPath))
+            $elsewhereExit = Invoke-OneChild $childElsewhere
+            Assert-Case ($elsewhereExit -eq 0 -and (Test-Path -LiteralPath $differentPath)) 'EXACT_FILE_LOCK_CANNOT_PROTECT_SIBLING'
+            Assert-Case ([IO.File]::ReadAllText($fixture, $utf8) -ceq 'known-original-bytes') 'PROTECTED_FILE_BYTES_UNCHANGED'
+          } finally { $target.Dispose() }
+          $guardStillExists = Test-Path -LiteralPath $guardPath -PathType Leaf
+          Assert-Case $guardStillExists 'LOCK_FILE_PRESERVED_NO_CLEANUP'
+          Write-Output ('LAB_PASS=1 CHECKS=' + $passed + ' ROOT_IS_RUNNER_TEMP=TRUE')
+          Write-Output 'NO_REAL_PROJECT_NO_ACL_CHANGE_NO_USER_CREATION_NO_CLEANUP_NO_UPLOAD=TRUE'
