@@ -1,0 +1,109 @@
+name: Windows Synthetic Storage Lab
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  physical-windows-checks:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - name: Test fictional files on an ephemeral Windows VM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -cne 'Windows') { throw 'NOT_A_WINDOWS_RUNNER' }
+          $root = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          $lab = [IO.Path]::GetFullPath((Join-Path $root ('fictional-ledger-' + [guid]::NewGuid().ToString('N'))))
+          if (-not $lab.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'PATH_OUTSIDE_TEMP' }
+          if (Test-Path -LiteralPath $lab) { throw 'LAB_ALREADY_EXISTS' }
+          [void][IO.Directory]::CreateDirectory($lab)
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          $passed = 0
+          function Assert-Test([bool]$condition, [string]$caseName) {
+            if (-not $condition) { throw ('FAILED_' + $caseName) }
+            $script:passed++
+            Write-Output ('PASS=' + $caseName)
+          }
+          function Get-Digest([byte[]]$bytes) {
+            return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+          }
+          function New-FictionalFile([string]$name, [byte[]]$bytes) {
+            if ($name -cnotmatch '^[a-z0-9-]+\.(json|dat)$') { throw 'UNSAFE_FILE_NAME' }
+            $target = Join-Path $lab $name
+            if (Test-Path -LiteralPath $target) { throw 'FILE_ALREADY_EXISTS' }
+            $handle = [IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $handle.Write($bytes, 0, $bytes.Length); $handle.Flush($true) } finally { $handle.Dispose() }
+            if ((Get-Digest ([IO.File]::ReadAllBytes($target))) -cne (Get-Digest $bytes)) { throw 'FILE_READBACK_MISMATCH' }
+            return $target
+          }
+          Assert-Test (Test-Path -LiteralPath $lab -PathType Container) 'TEMP_DIRECTORY_CREATED'
+          $fronts = @(for ($n = 0; $n -lt 168; $n++) { [ordered]@{ id = ('fiction-' + $n); status = 'active'; unknown = 'preserve' } })
+          $genesis = [ordered]@{ schema = 1; unknownTop = 'keep'; fronts = $fronts }
+          $genesisBytes = $utf8.GetBytes((ConvertTo-Json -InputObject $genesis -Depth 20 -Compress))
+          $genesisPath = New-FictionalFile 'genesis.json' $genesisBytes
+          $intent = [ordered]@{ operationId = 'fake-op-a'; predecessor = (Get-Digest $genesisBytes); target = 'fiction-new' }
+          $intentBytes = $utf8.GetBytes((ConvertTo-Json -InputObject $intent -Depth 20 -Compress))
+          $intentPath = New-FictionalFile 'intent-a.json' $intentBytes
+          $delta = [ordered]@{ action = 'create'; front = [ordered]@{ id = 'fiction-new'; status = 'active'; unknown = 'keep' } }
+          $commit = [ordered]@{ operationId = 'fake-op-a'; predecessor = $intent.predecessor; intentHash = (Get-Digest $intentBytes); delta = $delta }
+          $commitBytes = $utf8.GetBytes((ConvertTo-Json -InputObject $commit -Depth 20 -Compress))
+          $commitPath = New-FictionalFile 'commit-a.json' $commitBytes
+          $savedIntent = [IO.File]::ReadAllText($intentPath, $utf8) | ConvertFrom-Json -AsHashtable
+          $savedCommit = [IO.File]::ReadAllText($commitPath, $utf8) | ConvertFrom-Json -AsHashtable
+          Assert-Test ($savedCommit.predecessor -ceq (Get-Digest $genesisBytes)) 'PREDECESSOR_MATCH'
+          Assert-Test ($savedCommit.intentHash -ceq (Get-Digest $intentBytes) -and $savedIntent.operationId -ceq $savedCommit.operationId) 'INTENT_MATCH'
+          Assert-Test (-not $savedCommit.Contains('fronts') -and $savedCommit.delta.action -ceq 'create') 'DELTA_ONLY'
+          $replayed = [IO.File]::ReadAllText($genesisPath, $utf8) | ConvertFrom-Json -AsHashtable
+          $replayed.fronts = @($replayed.fronts) + @($savedCommit.delta.front)
+          Assert-Test ($replayed.fronts.Count -eq 169 -and $replayed.unknownTop -ceq 'keep' -and $replayed.fronts[0].unknown -ceq 'preserve') 'REPLAY_PRESERVES_UNKNOWN'
+          $pending = [ordered]@{ operationId = 'fake-op-pending'; predecessor = (Get-Digest $commitBytes) }
+          $null = New-FictionalFile 'intent-pending.json' $utf8.GetBytes((ConvertTo-Json -InputObject $pending -Compress))
+          Assert-Test (-not (Test-Path -LiteralPath (Join-Path $lab 'commit-pending.json'))) 'PENDING_DETECTED'
+          $fork = [ordered]@{ operationId = 'fake-op-fork'; predecessor = $commit.predecessor; intentHash = 'FICTION_ONLY' }
+          $forkPath = New-FictionalFile 'commit-fork.json' $utf8.GetBytes((ConvertTo-Json -InputObject $fork -Compress))
+          $forkRead = [IO.File]::ReadAllText($forkPath, $utf8) | ConvertFrom-Json -AsHashtable
+          Assert-Test ($forkRead.predecessor -ceq $savedCommit.predecessor -and (Get-Digest ([IO.File]::ReadAllBytes($forkPath))) -cne (Get-Digest $commitBytes)) 'FORK_DETECTED'
+          $invalidPath = New-FictionalFile 'commit-invalid.json' $utf8.GetBytes('{"operationId":')
+          $invalidRejected = $false
+          try { $null = [IO.File]::ReadAllText($invalidPath, $utf8) | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { $invalidRejected = $true }
+          Assert-Test $invalidRejected 'CORRUPT_JSON_REJECTED'
+          Assert-Test ($invalidRejected -and $forkRead.predecessor -ceq $savedCommit.predecessor) 'UNSAFE_SNAPSHOT_PROMOTION_BLOCKED'
+          $lockPath = New-FictionalFile 'lock.dat' $utf8.GetBytes('FICTIONAL')
+          $handle = [IO.File]::Open($lockPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+          try {
+            $other = [IO.File]::Open($lockPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try { Assert-Test ($other.Length -eq $handle.Length) 'PARALLEL_READ_ALLOWED' } finally { $other.Dispose() }
+            $child = @'
+          try {
+            $h = [IO.File]::Open('__FICTITIOUS_PATH__', [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            $h.Dispose()
+            exit 0
+          } catch [System.IO.IOException] { exit 17 } catch { exit 88 }
+          '@
+            $child = $child.Replace('__FICTITIOUS_PATH__', $lockPath.Replace("'", "''"))
+            $info = [Diagnostics.ProcessStartInfo]::new((Get-Command pwsh.exe -ErrorAction Stop).Source)
+            $info.UseShellExecute = $false
+            $info.CreateNoWindow = $true
+            foreach ($argument in @('-NoProfile', '-NonInteractive', '-Command', $child)) { [void]$info.ArgumentList.Add($argument) }
+            $process = [Diagnostics.Process]::Start($info)
+            if ($null -eq $process) { throw 'CHILD_NOT_STARTED' }
+            try {
+              if (-not $process.WaitForExit(12000)) { throw 'CHILD_TIMEOUT' }
+              Assert-Test ($process.ExitCode -eq 17) 'INDEPENDENT_PROCESS_WRITE_REFUSED'
+            } finally { $process.Dispose() }
+          } finally { $handle.Dispose() }
+          Assert-Test ((Get-Digest ([IO.File]::ReadAllBytes($lockPath))) -ceq (Get-Digest ($utf8.GetBytes('FICTIONAL')))) 'LOCK_RELEASE_PRESERVES_DATA'
+          $createNewRejected = $false
+          try {
+            $collision = [IO.File]::Open($genesisPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $collision.Dispose()
+          } catch [System.IO.IOException] { $createNewRejected = $true }
+          Assert-Test $createNewRejected 'CREATE_NEW_REFUSES_EXISTING_FILE'
+          $allFiles = @(Get-ChildItem -LiteralPath $lab -File -Force)
+          Assert-Test ($allFiles.Count -eq 7) 'ONLY_SEVEN_FICTIONAL_FILES_CREATED'
+          Write-Output ('LAB_PASS=1 TESTS=' + $passed + ' FILES=' + $allFiles.Count + ' LOGICAL_BYTES=' + (($allFiles | Measure-Object Length -Sum).Sum))
+          Write-Output 'NO_REAL_DATA_NO_GIT_NO_CLEANUP_NO_ARTIFACT_UPLOAD=TRUE'
