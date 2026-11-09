@@ -1,0 +1,96 @@
+name: QA23 Synthetic Atomic ACL Cross-User Boundary V3 (UNAPPROVED)
+# DRAFT ONLY: publication and dispatch require separate authorization.
+# Hosted Windows disposable runner; creates two fixture directories, a local standard
+# account, and at most two positive-control files. Never deletes or changes QA data.
+# Not a certification of QA Manager global isolation or legacy writer containment.
+# V2 preserved: complete DACL ACE flags readback, minimal explicit child environment.
+# V3 only: account description shortened and length guarded before account creation.
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  atomic-acl-cross-user:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Synthetic positive and negative direct-write boundary (no cleanup)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # READ-ONLY PREFLIGHT. Abort before creating any account or file on mismatch.
+          if ($env:RUNNER_OS -cne 'Windows') { throw 'STOP_NOT_WINDOWS' }
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'STOP_NOT_GITHUB_HOSTED' }
+          if ($env:GITHUB_REPOSITORY -cne 'diegopessoaltrabalho-sys/windows-transaction-fixtures-20261106') { throw 'STOP_WRONG_REPOSITORY' }
+          if ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch') { throw 'STOP_NOT_MANUAL_TRIGGER' }
+          if ($env:GITHUB_REF -cne 'refs/heads/main') { throw 'STOP_WRONG_REF' }
+          if ($env:GITHUB_RUN_ATTEMPT -cne '1') { throw 'STOP_RERUN_FORBIDDEN' }
+          if ($env:GITHUB_RUN_ID -notmatch '^[0-9]+$') { throw 'STOP_INVALID_RUN_ID' }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $admin = [Security.Principal.WindowsPrincipal]::new($identity)
+          if ($identity.User.Value -ceq 'S-1-5-18') { throw 'STOP_PARENT_LOCAL_SYSTEM' }
+          if (-not $admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'STOP_PARENT_NOT_ADMIN' }
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) { throw 'STOP_NO_RUNNER_TEMP' }
+          if (-not [IO.Path]::IsPathFullyQualified($env:RUNNER_TEMP)) { throw 'STOP_TEMP_NOT_ABSOLUTE' }
+          $base = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([char]'\')
+          if (-not [IO.Directory]::Exists($base)) { throw 'STOP_TEMP_NOT_FOUND' }
+          $cursor = [IO.DirectoryInfo]::new($base)
+          while ($null -ne $cursor) {
+            if ($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'STOP_REPARSE_ANCESTOR' }
+            $cursor = $cursor.Parent
+          }
+          $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($base))
+          if ($drive.DriveFormat -cne 'NTFS') { throw 'STOP_NOT_NTFS' }
+          if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) { throw 'STOP_NO_SYSTEMROOT' }
+          $wd = [IO.Path]::GetFullPath($env:SystemRoot)
+          if (-not [IO.Directory]::Exists($wd)) { throw 'STOP_WORKDIR_MISSING' }
+          if (([IO.DirectoryInfo]::new($wd).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'STOP_WORKDIR_REPARSE' }
+          $nonce = [guid]::NewGuid().ToString('N').Substring(0,16)
+          $tag = $env:GITHUB_RUN_ID + '-' + $nonce
+          $allowed = [IO.Path]::GetFullPath([IO.Path]::Combine($base,'qa23-allow-' + $tag))
+          $blocked = [IO.Path]::GetFullPath([IO.Path]::Combine($base,'qa23-block-' + $tag))
+          foreach ($path in @($allowed,$blocked)) {
+            if (-not $path.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'STOP_OUT_OF_SCOPE' }
+            if ([IO.Directory]::Exists($path) -or [IO.File]::Exists($path)) { throw 'STOP_TARGET_ALREADY_EXISTS' }
+          }
+          Write-Output ('FIXTURE_ROOT=' + $base)
+          Write-Output ('FIXTURE_ALLOWED_DIR=' + $allowed)
+          Write-Output ('FIXTURE_BLOCKED_DIR=' + $blocked)
+          Write-Output 'PLANNED_EFFECTS=ONE_EPHEMERAL_ACCOUNT_TWO_NEW_DIRECTORIES_THREE_EXCLUSIVE_FILE_ATTEMPTS'
+
+          # MUTATION ON EPHEMERAL RUNNER ONLY: one new account. No cleanup operation.
+          $userName = 'qa23' + [guid]::NewGuid().ToString('N').Substring(0,12)
+          if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) { throw 'STOP_USER_COLLISION' }
+          $plain = 'Aa9!' + [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
+          $password = ConvertTo-SecureString $plain -AsPlainText -Force
+          $plain = $null
+          $accountDescription = 'QA23 synthetic ACL boundary test on hosted VM'
+          if ($accountDescription.Length -gt 48) { throw 'STOP_ACCOUNT_DESCRIPTION_TOO_LONG' }
+          $account = New-LocalUser -Name $userName -Password $password -AccountNeverExpires -Description $accountDescription
+          $userSid = [string]$account.SID.Value
+          if ($userSid -notmatch '^S-1-5-21-[0-9-]+$') { throw 'STOP_NEW_USER_SID_INVALID' }
+          if ($userSid.Length -gt 64) { throw 'STOP_USER_SID_OVERSIZE' }
+          $sidObject = [Security.Principal.SecurityIdentifier]::new($userSid)
+          $systemSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+          $adminsSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+
+          # An explicit protected DACL is supplied to CreateDirectory AT BIRTH.
+          # Never use Directory.CreateDirectory followed by Set-Acl (unsafe gap).
+          function New-ProtectedAcl([Security.Principal.SecurityIdentifier[]]$sids) {
+            $sec = [Security.AccessControl.DirectorySecurity]::new()
+            $sec.SetAccessRuleProtection($true,$false)
+            $inherit = [Security.AccessControl.InheritanceFlags]([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit)
+            foreach ($s in $sids) {
+              $ace = [Security.AccessControl.FileSystemAccessRule]::new($s,[Security.AccessControl.FileSystemRights]::FullControl,$inherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)
+              $sec.AddAccessRule($ace)
+            }
+            return $sec
+          }
+          function Assert-ExactAcl([string]$path,[string[]]$expected) {
+            $acl = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($path))
+            if (-not $acl.AreAccessRulesProtected) { throw 'STOP_ACL_INHERITANCE_UNPROTECTED' }
+            $rules = @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+            if ($rules.Count -ne $expected.Count) { throw 'STOP_ACL_RULE_COUNT_MISMATCH' }
+            $expectedInheritance = [Security.AccessControl.InheritanceFlags]([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit)
+            foreach ($rule in $rules) {
+              if ($rule.IsInherited -or $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl) { throw 'STOP_ACL_RULE_NOT_EXACT' }
