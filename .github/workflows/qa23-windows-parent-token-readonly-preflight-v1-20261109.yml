@@ -1,0 +1,50 @@
+
+name: QA23 Windows Parent Token Read-Only Preflight V1
+# SYNTHETIC / READ ONLY. Does not test alternate credentials or filesystem ACL isolation.
+# Publishing and dispatching this workflow require separate authorization.
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  parent-token-observation:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 3
+    steps:
+      - name: Observe parent Windows identity and logon SID without mutations
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -cne 'Windows') { throw 'STOP_NOT_WINDOWS' }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          if ($null -eq $identity -or $null -eq $identity.User) { throw 'STOP_NO_IDENTITY' }
+          try {
+            $sid = [string]$identity.User.Value
+            $isLocalSystem = [string]::Equals($sid, 'S-1-5-18', [StringComparison]::Ordinal)
+            $hasLogonSid = $false
+            if ($null -ne $identity.Groups) {
+              foreach ($group in $identity.Groups) {
+                if ($null -ne $group -and $group.Value -match '^S-1-5-5-[0-9]+-[0-9]+$') {
+                  $hasLogonSid = $true
+                }
+              }
+            }
+            $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+            $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            $process = [Diagnostics.Process]::GetCurrentProcess()
+            try {
+              Write-Output ('PARENT_IS_LOCALSYSTEM=' + $isLocalSystem)
+              Write-Output ('PARENT_HAS_LOGON_SID=' + $hasLogonSid)
+              Write-Output ('PARENT_IS_ADMIN=' + $isAdmin)
+              Write-Output ('PARENT_SESSION_ID=' + $process.SessionId)
+              Write-Output 'ALTERNATE_USER_SPAWN_ATTEMPTED=False'
+              Write-Output 'ACCOUNT_CREATION_ATTEMPTED=False'
+              Write-Output 'FILESYSTEM_ISOLATION_TESTED=False'
+              Write-Output 'OPERATIONAL_AUTHORIZED=False'
+              Write-Output 'READ_ONLY_TOKEN_DIAGNOSTIC_COMPLETED=True'
+            } finally {
+              $process.Dispose()
+            }
+          } finally {
+            $identity.Dispose()
+          }
