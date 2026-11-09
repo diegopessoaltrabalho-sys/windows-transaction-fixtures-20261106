@@ -1,0 +1,90 @@
+
+name: QA23 Synthetic Cross-User Spawn Only V2 (UNAPPROVED)
+# UNAPPROVED static candidate: requires separate authorization to create in GitHub and dispatch.
+# Windows hosted runner only. Creates a local account/profile in that disposable runner.
+# NOT an E3 physical-isolation attestation. No QA Manager / private repository access.
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  cross-user-spawn-only:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 4
+    steps:
+      - name: Diagnose a single alternative-user process launch (NO ACL TEST)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -cne 'Windows') { throw 'STOP_NOT_WINDOWS' }
+          $who = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $who.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'STOP_RUNNER_NOT_ADMIN' }
+
+          # Existing Windows directory is used as cwd, exclusively for the launch diagnostic.
+          # No custom lab directory, fixture, ACL edit, or file is created by this workflow.
+          if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) { throw 'STOP_SYSTEMROOT_MISSING' }
+          $wd = [IO.Path]::GetFullPath($env:SystemRoot)
+          if (-not [IO.Directory]::Exists($wd)) { throw 'STOP_WORKDIR_NOT_FOUND' }
+          if (([IO.DirectoryInfo]::new($wd).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'STOP_WORKDIR_REPARSE' }
+
+          # Creates ONE account, and potentially a user profile, on the EPHEMERAL runner only.
+          # This is an external effect that requires separate authorization before dispatch.
+          $userName = 'qa23' + [guid]::NewGuid().ToString('N').Substring(0,12)
+          if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) { throw 'STOP_USER_COLLISION' }
+          $passwordText = 'Aa9!' + [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
+          $password = ConvertTo-SecureString $passwordText -AsPlainText -Force
+          $passwordText = $null
+          $created = New-LocalUser -Name $userName -Password $password -AccountNeverExpires -Description 'QA23 fictitious ephemeral spawn diagnostic'
+          $sid = [string]$created.SID.Value
+          if ($sid -notmatch '^S-1-5-21-[0-9-]+$') { throw 'STOP_NEW_SID_UNVERIFIED' }
+          Write-Output 'PRECONDITION_EPHEMERAL_ACCOUNT_CREATED=True'
+
+          # The child performs only identity checks and returns an exit code. No ACL/write test.
+          $childScript = @'
+          $ErrorActionPreference = 'Stop'
+          $expectedSid = '__SID__'
+          try {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            if ($identity.User.Value -cne $expectedSid) { exit 41 }
+            $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+            if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 42 }
+            exit 17
+          } catch { exit 43 }
+          '@
+          $childScript = $childScript.Replace('__SID__', $sid)
+          $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+          $psi = [Diagnostics.ProcessStartInfo]::new($pwsh)
+          $psi.UseShellExecute = $false
+          $psi.CreateNoWindow = $true
+          $psi.LoadUserProfile = $true
+          $psi.UserName = $userName
+          $psi.Domain = $env:COMPUTERNAME
+          $psi.Password = $password
+          # Only intended cross-user spawn configuration change vs failed historical run:
+          $psi.WorkingDirectory = $wd
+          foreach($arg in @('-NoProfile','-NonInteractive','-EncodedCommand',[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript)))) {
+            [void]$psi.ArgumentList.Add($arg)
+          }
+
+          # Exactly ONE attempt. Never retry with different credentials, cwd, flags, or tool.
+          try { $child = [Diagnostics.Process]::Start($psi) }
+          catch {
+            $ex = $_.Exception
+            Write-Output ('SPAWN_EXCEPTION_TYPE=' + $ex.GetType().FullName)
+            Write-Output ('SPAWN_EXCEPTION_HRESULT=' + $ex.HResult)
+            if ($ex.InnerException -is [ComponentModel.Win32Exception]) {
+              Write-Output ('SPAWN_NATIVE_ERROR=' + $ex.InnerException.NativeErrorCode)
+            }
+            throw 'STOP_SPAWN_FAILED_NO_RETRY'
+          }
+          if ($null -eq $child) { throw 'STOP_NULL_PROCESS' }
+          Write-Output 'SPAWN_STARTED=True'
+          try {
+            if (-not $child.WaitForExit(15000)) { throw 'STOP_CHILD_TIMEOUT_NO_KILL_NO_RETRY' }
+            if ($child.ExitCode -ne 17) { throw ('STOP_CHILD_SELF_CHECK_EXIT_' + $child.ExitCode) }
+          } finally { $child.Dispose() }
+          Write-Output 'CHILD_SID_SELF_CHECK=True'
+          Write-Output 'CHILD_NONADMIN_SELF_CHECK=True'
+          Write-Output 'INDEPENDENT_PROCESS_TOKEN_ATTESTATION=False'
+          Write-Output 'FILESYSTEM_DENIAL_NOT_TESTED=True'
+          Write-Output 'NO_QA_MANAGER_DATA_LOADED_BY_WORKFLOW=True'
