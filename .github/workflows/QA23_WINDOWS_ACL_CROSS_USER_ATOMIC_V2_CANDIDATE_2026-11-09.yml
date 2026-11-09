@@ -1,0 +1,176 @@
+name: QA23 Synthetic Atomic ACL Cross-User Boundary V2 (UNAPPROVED)
+# DRAFT ONLY: publication and dispatch require separate authorization.
+# Hosted Windows disposable runner; creates two fixture directories, a local standard
+# account, and at most two positive-control files. Never deletes or changes QA data.
+# Not a certification of QA Manager global isolation or legacy writer containment.
+# V2 changes: complete DACL ACE flags readback, minimal explicit child environment.
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  atomic-acl-cross-user:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Synthetic positive and negative direct-write boundary (no cleanup)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # READ-ONLY PREFLIGHT. Abort before creating any account or file on mismatch.
+          if ($env:RUNNER_OS -cne 'Windows') { throw 'STOP_NOT_WINDOWS' }
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'STOP_NOT_GITHUB_HOSTED' }
+          if ($env:GITHUB_REPOSITORY -cne 'diegopessoaltrabalho-sys/windows-transaction-fixtures-20261106') { throw 'STOP_WRONG_REPOSITORY' }
+          if ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch') { throw 'STOP_NOT_MANUAL_TRIGGER' }
+          if ($env:GITHUB_REF -cne 'refs/heads/main') { throw 'STOP_WRONG_REF' }
+          if ($env:GITHUB_RUN_ATTEMPT -cne '1') { throw 'STOP_RERUN_FORBIDDEN' }
+          if ($env:GITHUB_RUN_ID -notmatch '^[0-9]+$') { throw 'STOP_INVALID_RUN_ID' }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $admin = [Security.Principal.WindowsPrincipal]::new($identity)
+          if ($identity.User.Value -ceq 'S-1-5-18') { throw 'STOP_PARENT_LOCAL_SYSTEM' }
+          if (-not $admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'STOP_PARENT_NOT_ADMIN' }
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) { throw 'STOP_NO_RUNNER_TEMP' }
+          if (-not [IO.Path]::IsPathFullyQualified($env:RUNNER_TEMP)) { throw 'STOP_TEMP_NOT_ABSOLUTE' }
+          $base = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([char]'\')
+          if (-not [IO.Directory]::Exists($base)) { throw 'STOP_TEMP_NOT_FOUND' }
+          $cursor = [IO.DirectoryInfo]::new($base)
+          while ($null -ne $cursor) {
+            if ($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'STOP_REPARSE_ANCESTOR' }
+            $cursor = $cursor.Parent
+          }
+          $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($base))
+          if ($drive.DriveFormat -cne 'NTFS') { throw 'STOP_NOT_NTFS' }
+          if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) { throw 'STOP_NO_SYSTEMROOT' }
+          $wd = [IO.Path]::GetFullPath($env:SystemRoot)
+          if (-not [IO.Directory]::Exists($wd)) { throw 'STOP_WORKDIR_MISSING' }
+          if (([IO.DirectoryInfo]::new($wd).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'STOP_WORKDIR_REPARSE' }
+          $nonce = [guid]::NewGuid().ToString('N').Substring(0,16)
+          $tag = $env:GITHUB_RUN_ID + '-' + $nonce
+          $allowed = [IO.Path]::GetFullPath([IO.Path]::Combine($base,'qa23-allow-' + $tag))
+          $blocked = [IO.Path]::GetFullPath([IO.Path]::Combine($base,'qa23-block-' + $tag))
+          foreach ($path in @($allowed,$blocked)) {
+            if (-not $path.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'STOP_OUT_OF_SCOPE' }
+            if ([IO.Directory]::Exists($path) -or [IO.File]::Exists($path)) { throw 'STOP_TARGET_ALREADY_EXISTS' }
+          }
+          Write-Output ('FIXTURE_ROOT=' + $base)
+          Write-Output ('FIXTURE_ALLOWED_DIR=' + $allowed)
+          Write-Output ('FIXTURE_BLOCKED_DIR=' + $blocked)
+          Write-Output 'PLANNED_EFFECTS=ONE_EPHEMERAL_ACCOUNT_TWO_NEW_DIRECTORIES_THREE_EXCLUSIVE_FILE_ATTEMPTS'
+
+          # MUTATION ON EPHEMERAL RUNNER ONLY: one new account. No cleanup operation.
+          $userName = 'qa23' + [guid]::NewGuid().ToString('N').Substring(0,12)
+          if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) { throw 'STOP_USER_COLLISION' }
+          $plain = 'Aa9!' + [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
+          $password = ConvertTo-SecureString $plain -AsPlainText -Force
+          $plain = $null
+          $account = New-LocalUser -Name $userName -Password $password -AccountNeverExpires -Description 'QA23 synthetic ACL boundary test on hosted runner'
+          $userSid = [string]$account.SID.Value
+          if ($userSid -notmatch '^S-1-5-21-[0-9-]+$') { throw 'STOP_NEW_USER_SID_INVALID' }
+          if ($userSid.Length -gt 64) { throw 'STOP_USER_SID_OVERSIZE' }
+          $sidObject = [Security.Principal.SecurityIdentifier]::new($userSid)
+          $systemSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+          $adminsSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+
+          # An explicit protected DACL is supplied to CreateDirectory AT BIRTH.
+          # Never use Directory.CreateDirectory followed by Set-Acl (unsafe gap).
+          function New-ProtectedAcl([Security.Principal.SecurityIdentifier[]]$sids) {
+            $sec = [Security.AccessControl.DirectorySecurity]::new()
+            $sec.SetAccessRuleProtection($true,$false)
+            $inherit = [Security.AccessControl.InheritanceFlags]([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit)
+            foreach ($s in $sids) {
+              $ace = [Security.AccessControl.FileSystemAccessRule]::new($s,[Security.AccessControl.FileSystemRights]::FullControl,$inherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)
+              $sec.AddAccessRule($ace)
+            }
+            return $sec
+          }
+          function Assert-ExactAcl([string]$path,[string[]]$expected) {
+            $acl = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($path))
+            if (-not $acl.AreAccessRulesProtected) { throw 'STOP_ACL_INHERITANCE_UNPROTECTED' }
+            $rules = @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+            if ($rules.Count -ne $expected.Count) { throw 'STOP_ACL_RULE_COUNT_MISMATCH' }
+            $expectedInheritance = [Security.AccessControl.InheritanceFlags]([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit)
+            foreach ($rule in $rules) {
+              if ($rule.IsInherited -or $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl) { throw 'STOP_ACL_RULE_NOT_EXACT' }
+              if ($rule.InheritanceFlags -ne $expectedInheritance -or $rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) { throw 'STOP_ACL_FLAGS_NOT_EXACT' }
+              if ([string]$rule.IdentityReference.Value -cnotin $expected) { throw 'STOP_ACL_UNEXPECTED_SID' }
+            }
+            foreach ($sidExpected in $expected) {
+              if (@($rules | Where-Object { $_.IdentityReference.Value -ceq $sidExpected }).Count -ne 1) { throw 'STOP_ACL_SID_COUNT_MISMATCH' }
+            }
+          }
+          # MUTATIONS: exactly two new folders, each protected at creation.
+          $onlyAdmins = New-ProtectedAcl @($systemSid,$adminsSid)
+          $controlAcl = New-ProtectedAcl @($systemSid,$adminsSid,$sidObject)
+          [void][IO.FileSystemAclExtensions]::CreateDirectory($onlyAdmins,$blocked)
+          Assert-ExactAcl $blocked @('S-1-5-18','S-1-5-32-544')
+          [void][IO.FileSystemAclExtensions]::CreateDirectory($controlAcl,$allowed)
+          Assert-ExactAcl $allowed @('S-1-5-18','S-1-5-32-544',$userSid)
+          Write-Output 'ACL_CREATED_WITH_PROTECTION=True'
+          Write-Output 'ACL_READBACK_EXACT=True'
+
+          # POSITIVE CONTROL: parent administrator writes exclusively inside blocked dir.
+          $parentProof = [IO.Path]::Combine($blocked,'parent-allow.bin')
+          $childAllowedFile = [IO.Path]::Combine($allowed,'child-allow.bin')
+          $childBlockedFile = [IO.Path]::Combine($blocked,'child-block-attempt.bin')
+          foreach ($path in @($parentProof,$childAllowedFile,$childBlockedFile)) {
+            if ([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)) { throw 'STOP_PROBE_PATH_COLLISION' }
+          }
+          $proofStream = [IO.File]::Open($parentProof,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+          try { $proofStream.Write([byte[]](0x51,0x41),0,2) } finally { $proofStream.Dispose() }
+          if ([IO.File]::ReadAllBytes($parentProof).Length -ne 2) { throw 'STOP_PARENT_CONTROL_READBACK' }
+          Write-Output 'PARENT_ALLOWED_IN_PROTECTED_DIR=True'
+
+          # Child performs direct FileMode.CreateNew operations; no coordinator or broker.
+          # Control must SUCCEED before denied write can be counted as valid evidence.
+          $childScript = @'
+          $i=[Security.Principal.WindowsIdentity]::GetCurrent();if($i.User.Value -cne $env:QA23_EXPECTED_SID){exit 41};if([Security.Principal.WindowsPrincipal]::new($i).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){exit 42};try{[IO.File]::Open($env:QA23_ALLOW_PATH,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None).Dispose()}catch{exit 43};try{[IO.File]::Open($env:QA23_BLOCK_PATH,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None).Dispose();exit 51}catch [UnauthorizedAccessException]{exit 17}catch{exit 52}
+          '@
+          if ($childScript.Contains('"') -or $childScript.Contains("`n")) { throw 'STOP_CHILD_ARG_ESCAPING_UNREVIEWED' }
+          $pwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+          $psi = [Diagnostics.ProcessStartInfo]::new($pwsh)
+          $psi.UseShellExecute = $false
+          $psi.CreateNoWindow = $true
+          $psi.LoadUserProfile = $true
+          $psi.UserName = $userName
+          $psi.Domain = $env:COMPUTERNAME
+          $psi.Password = $password
+          $psi.WorkingDirectory = $wd
+          # Explicit minimum environment: do not forward the runner's inherited variables.
+          # The only writable temp target given to the child is the positive fixture.
+          $psi.Environment.Clear()
+          $psi.Environment['SystemRoot'] = $wd
+          $psi.Environment['WINDIR'] = $wd
+          $psi.Environment['PATH'] = [IO.Path]::GetDirectoryName($pwsh) + ';' + [IO.Path]::Combine($wd,'System32')
+          $psi.Environment['TEMP'] = $allowed
+          $psi.Environment['TMP'] = $allowed
+          $psi.Environment['QA23_EXPECTED_SID'] = $userSid
+          $psi.Environment['QA23_ALLOW_PATH'] = $childAllowedFile
+          $psi.Environment['QA23_BLOCK_PATH'] = $childBlockedFile
+          foreach ($arg in @('-NoProfile','-NonInteractive','-Command',$childScript)) { [void]$psi.ArgumentList.Add($arg) }
+          $cmdLength = $psi.FileName.Length + 2
+          foreach ($arg in $psi.ArgumentList) {
+            $cmdLength += 1 + $arg.Length
+            if ($arg -match '\s') { $cmdLength += 2 }
+          }
+          Write-Output ('SPAWN_COMMANDLINE_UPPER_BOUND=' + $cmdLength)
+          if ($cmdLength -ge 900) { throw 'STOP_COMMANDLINE_EXCEEDS_SAFE_BOUND' }
+          # Exactly one spawn; no fallback process, no retry and no termination/cleanup.
+          try { $child = [Diagnostics.Process]::Start($psi) }
+          catch { throw ('STOP_SPAWN_FAILED_NO_RETRY:' + $_.Exception.GetType().Name) }
+          if ($null -eq $child) { throw 'STOP_SPAWN_RETURNED_NULL' }
+          try {
+            if (-not $child.WaitForExit(60000)) { throw 'STOP_CHILD_TIMEOUT_NO_KILL' }
+            $code = $child.ExitCode
+          } finally { $child.Dispose() }
+          Write-Output ('CHILD_EXIT_CODE=' + $code)
+          if ($code -ne 17) { throw ('STOP_CHILD_NEGATIVE_OR_CONTROL_FAILED_' + $code) }
+          if (-not [IO.File]::Exists($childAllowedFile)) { throw 'STOP_ALLOW_POSITIVE_FILE_ABSENT' }
+          if ([IO.File]::Exists($childBlockedFile) -or [IO.Directory]::Exists($childBlockedFile)) { throw 'STOP_BLOCKED_FILE_UNEXPECTEDLY_EXISTS' }
+          Write-Output 'CHILD_EXPECTED_IDENTITY_SELF_CHECK=True'
+          Write-Output 'CHILD_NONADMIN_SELF_CHECK=True'
+          Write-Output 'CHILD_POSITIVE_DIRECT_WRITE=True'
+          Write-Output 'CHILD_BLOCKED_DIRECT_WRITE=True'
+          Write-Output 'INDEPENDENT_CHILD_TOKEN_ATTESTATION=False'
+          Write-Output 'ONLY_SYNTHETIC_FIXTURE_ISOLATION_TESTED=True'
+          Write-Output 'PRODUCTION_E3_CERTIFIED=False'
+          Write-Output 'NO_QA_MANAGER_DATA_LOADED_BY_WORKFLOW=True'
